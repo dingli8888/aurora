@@ -92,25 +92,25 @@ func generateFingerprint(
 	}
 
 	return []interface{}{
-		screenW + screenW/2,                       // [0]  screen.width + screen.height
-		_legacyParseTime(),                        // [1]  Date.prototype.toString()
-		4294967296,                                // [2]  jsHeapSizeLimit (Chrome 4GB)
-		c3,                                        // [3]  Math.random() / PoW nonce
-		userAgent,                                 // [4]  navigator.userAgent
-		scriptSrc,                                 // [5]  currentScript.src
-		nil,                                       // [6]  documentElement[data-build]
-		"zh-CN",                                   // [7]  navigator.language
-		"zh-CN,en,en-GB,en-US",                    // [8]  navigator.languages.join(",")
-		c9,                                        // [9]  Math.random() / PoW 耗时 ms
-		powNavKeys[rng.Intn(len(powNavKeys))],     // [10] 随机 navigator 原型方法
-		"_reactListening" + string(reactSuffix),   // [11] document 随机 key
-		powWinKeys[rng.Intn(len(powWinKeys))],     // [12] window 随机 key
-		perfNow,                                   // [13] performance.now()
-		deviceID,                                  // [14] sid / device_id
-		"",                                        // [15] location.search
-		powCores[rng.Intn(len(powCores))],         // [16] hardwareConcurrency
-		timeOrigin,                                // [17] performance.timeOrigin
-		0, 0, 0, 0, 0, 0, 0,                      // [18-24] "X in window" 检查（全部 0）
+		screenW + screenW/2,                     // [0]  screen.width + screen.height
+		_legacyParseTime(),                      // [1]  Date.prototype.toString()
+		int64(4294967296),                       // [2]  jsHeapSizeLimit (Chrome 4GB)
+		c3,                                      // [3]  Math.random() / PoW nonce
+		userAgent,                               // [4]  navigator.userAgent
+		scriptSrc,                               // [5]  currentScript.src
+		nil,                                     // [6]  documentElement[data-build]
+		"zh-CN",                                 // [7]  navigator.language
+		"zh-CN,en,en-GB,en-US",                  // [8]  navigator.languages.join(",")
+		c9,                                      // [9]  Math.random() / PoW 耗时 ms
+		powNavKeys[rng.Intn(len(powNavKeys))],   // [10] 随机 navigator 原型方法
+		"_reactListening" + string(reactSuffix), // [11] document 随机 key
+		powWinKeys[rng.Intn(len(powWinKeys))],   // [12] window 随机 key
+		perfNow,                                 // [13] performance.now()
+		deviceID,                                // [14] sid / device_id
+		"",                                      // [15] location.search
+		powCores[rng.Intn(len(powCores))],       // [16] hardwareConcurrency
+		timeOrigin,                              // [17] performance.timeOrigin
+		0, 0, 0, 0, 0, 0, 0,                     // [18-24] "X in window" 检查（全部 0）
 	}
 }
 
