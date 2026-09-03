@@ -374,8 +374,25 @@ func EnsurePatchDefaults(state *PatchState) {
 	}
 }
 
+// ResetMessage 丢弃当前消息状态，同时保留会话 ID 和已收集的引用映射。
+func ResetMessage(state *PatchState) {
+	state.Response.Message = chatgpt_types.Message{}
+	state.Channel = ""
+	state.nextRefIdx = 0
+	for key := range state.CiteAlts {
+		if strings.HasPrefix(key, "ref:") {
+			delete(state.CiteAlts, key)
+		}
+	}
+}
+
 // ApplyPatch 应用一个 conversation patch 操作。
 func ApplyPatch(state *PatchState, patchPath string, operation string, value interface{}) bool {
+	if patchPath == "/message/id" {
+		if text, ok := value.(string); ok && text != "" && state.Response.Message.ID != "" && text != state.Response.Message.ID {
+			ResetMessage(state)
+		}
+	}
 	EnsurePatchDefaults(state)
 	switch {
 	case patchPath == "/conversation_id":
@@ -384,6 +401,9 @@ func ApplyPatch(state *PatchState, patchPath string, operation string, value int
 		}
 	case patchPath == "/message":
 		if response, ok := ResponseFromValue(value); ok {
+			conversationID := state.Response.ConversationID
+			ResetMessage(state)
+			state.Response.ConversationID = conversationID
 			if response.ConversationID != "" {
 				state.Response.ConversationID = response.ConversationID
 			}
@@ -391,6 +411,7 @@ func ApplyPatch(state *PatchState, patchPath string, operation string, value int
 		}
 		if channel := ChannelFromValue(value); channel != "" {
 			state.Channel = channel
+			state.Response.Message.Channel = channel
 		}
 	case patchPath == "/message/id":
 		if text, ok := value.(string); ok {
@@ -399,6 +420,7 @@ func ApplyPatch(state *PatchState, patchPath string, operation string, value int
 	case patchPath == "/message/channel":
 		if text, ok := value.(string); ok {
 			state.Channel = text
+			state.Response.Message.Channel = text
 		}
 	case patchPath == "/message/author/role":
 		if text, ok := value.(string); ok {
@@ -463,10 +485,11 @@ func ApplyPatch(state *PatchState, patchPath string, operation string, value int
 // 提取 matched_text → alt 映射到 state.CiteAlts。
 //
 // 支持的路径形式:
-//   /message/metadata/content_references            (append 整个引用对象)
-//   /message/metadata/content_references/N          (append/replace 引用对象)
-//   /message/metadata/content_references/N/alt      (replace alt 字符串)
-//   /message/metadata/content_references/N/matched_text (append/replace 标记)
+//
+//	/message/metadata/content_references            (append 整个引用对象)
+//	/message/metadata/content_references/N          (append/replace 引用对象)
+//	/message/metadata/content_references/N/alt      (replace alt 字符串)
+//	/message/metadata/content_references/N/matched_text (append/replace 标记)
 func applyContentReferencePatch(state *PatchState, patchPath string, operation string, value interface{}) bool {
 	EnsurePatchDefaults(state)
 
@@ -635,6 +658,7 @@ func markerFallback(marker string) string {
 	}
 	return ""
 }
+
 // ── 流式 cite 处理管道 ──
 
 // MaxCiteHoldBytes 暂存区字节上限: 超过后强制放行(未解析标记由 ReplaceCiteMarkers 删除),
