@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -270,6 +271,22 @@ func (h *ChatHandler) Responses(c *gin.Context) {
 		return
 	}
 
+	var previousClientState *chatgpt.ChatClientState
+	if responsesRequest.PreviousResponseID != "" {
+		var callNames map[string]string
+		previousClientState, callNames = h.sessions.GetResponse(responsesRequest.PreviousResponseID)
+		if previousClientState == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{
+				"message": "Unknown previous_response_id: " + responsesRequest.PreviousResponseID,
+				"type":    "invalid_request_error",
+				"param":   "previous_response_id",
+				"code":    "invalid_previous_response_id",
+			}})
+			return
+		}
+		responsesRequest.ApplyFunctionCallNames(callNames)
+	}
+
 	original_request, err := responsesRequest.ToAPIRequest()
 	if err != nil {
 		c.JSON(400, gin.H{"error": gin.H{
@@ -320,17 +337,47 @@ func (h *ChatHandler) Responses(c *gin.Context) {
 
 	// 按 conversationID 复用 ChatClientState，保持 DeviceID/SessionID 一致
 	var clientState *chatgpt.ChatClientState
-	if translated_request.ConversationID != "" {
+	if previousClientState != nil {
+		clientState = previousClientState
+	} else if translated_request.ConversationID != "" {
 		clientState = h.sessions.Get(translated_request.ConversationID)
 	}
 	if clientState == nil {
 		clientState = chatgpt.NewChatClientState()
+	}
+	if previousClientState != nil {
+		translated_request.ConversationID = clientState.ConversationID
+		translated_request.ParentMessageID = clientState.ParentMessageID
 	}
 	clientState.ConversationID = translated_request.ConversationID
 	clientState.ParentMessageID = translated_request.ParentMessageID
 	reqModel := original_request.Model
 	if reqModel == "" {
 		reqModel = "auto"
+	}
+
+	toolsEnabled := toolCallingEnabled(original_request.Tools, h.cfg) && !original_request.ToolChoice.IsForcedNone()
+	if toolsEnabled {
+		result, ok := h.executeToolCalling(c, &original_request, &client, account, &clientState, &reqModel, &uid, &proxyUrl)
+		if !ok {
+			return
+		}
+		outputTokens := util.CountToken(result.Text)
+		responsesResponse := officialtypes.NewResponsesResponseWithToolCalls(
+			result.Text, "", result.ToolCalls,
+			input_tokens, outputTokens, 0, 0, 0, reqModel,
+		)
+		callNames := make(map[string]string, len(result.ToolCalls))
+		for _, call := range result.ToolCalls {
+			callNames[call.ID] = call.Function.Name
+		}
+		h.sessions.RegisterResponse(responsesResponse.ID, clientState, callNames)
+		if responsesRequest.Stream {
+			h.writeResponsesToolCallingStream(c, responsesResponse, result.ToolCalls)
+			return
+		}
+		c.JSON(http.StatusOK, responsesResponse)
+		return
 	}
 
 	// 提取 instructions / input 用于缓存模拟
@@ -425,6 +472,7 @@ func (h *ChatHandler) Responses(c *gin.Context) {
 		output_tokens := util.CountToken(full_response)
 		reasoning_tokens := util.CountToken(full_thinking)
 		responsesResponse := officialtypes.NewResponsesResponse(full_response, full_thinking, input_tokens, output_tokens, reasoning_tokens, cachedTokens, cacheWriteTokens, reqModel)
+		h.sessions.RegisterResponse(responsesResponse.ID, clientState, nil)
 		c.JSON(200, responsesResponse)
 		return
 	}
@@ -483,8 +531,9 @@ func (h *ChatHandler) Responses(c *gin.Context) {
 	for i := h.cfg.MaxContinueCount; i > 0; i-- {
 		var continue_info *chatgpt.ContinueInfo
 		result := chatgpt.HandlerDetailedWithOptions(c, response, client, account, uid, translated_request, true, reqModel, chatgpt.HandlerDetailedOptions{
-			Websocket:   wsConn,
-			ClientState: clientState,
+			Websocket:      wsConn,
+			ClientState:    clientState,
+			SuppressOutput: true,
 		})
 		wsConn = nil
 		full_response += result.Text
@@ -570,14 +619,14 @@ func (h *ChatHandler) Responses(c *gin.Context) {
 	output_tokens := util.CountToken(full_response)
 	reasoning_tokens := util.CountToken(full_thinking)
 	responsesResponse := officialtypes.NewResponsesResponse(full_response, full_thinking, input_tokens, output_tokens, reasoning_tokens, cachedTokens, cacheWriteTokens, reqModel)
-	// 在 response.completed 事件里附带 timing（HTTP headers 在首次 Flush 后不可写）
+	responsesResponse.ID = respID
 	responsesResponse.MsSinceStart = time.Since(startTime).Milliseconds()
 	if ttftSet {
 		responsesResponse.MsTTFT = ttftMs
 	}
+	h.sessions.RegisterResponse(responsesResponse.ID, clientState, nil)
 	// response.completed
 	c.Writer.WriteString("event: response.completed\ndata: " + responsesCompletedEvent(responsesResponse) + "\n\n")
-	c.Writer.WriteString("data: [DONE]\n\n")
 	if flusher != nil {
 		flusher.Flush()
 	}
@@ -658,11 +707,85 @@ func (h *ChatHandler) Files(c *gin.Context) {
 	c.JSON(200, uploaded)
 }
 
+func (h *ChatHandler) writeResponsesToolCallingStream(c *gin.Context, response officialtypes.ResponsesResponse, calls []officialtypes.ToolCall) {
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+
+	c.Writer.WriteString("event: response.created\ndata: " + responsesCreatedEvent(response.ID, response.Model) + "\n\n")
+	if len(calls) == 0 && len(response.Output) > 0 {
+		item := response.Output[len(response.Output)-1]
+		outputIndex := len(response.Output) - 1
+		c.Writer.WriteString("event: response.output_item.added\ndata: " + responsesOutputItemAddedEvent(outputIndex, item.ID, "message") + "\n\n")
+		if response.OutputText != "" {
+			textEvent := officialtypes.ResponsesTextDeltaEvent{
+				Type:         "response.output_text.delta",
+				ItemID:       item.ID,
+				OutputIndex:  outputIndex,
+				ContentIndex: 0,
+				Delta:        response.OutputText,
+			}
+			writeResponsesSSEEvent(c, "response.output_text.delta", textEvent)
+		}
+		c.Writer.WriteString("event: response.output_item.done\ndata: " + responsesOutputItemDoneEvent(outputIndex, item.ID, "message", response.OutputText) + "\n\n")
+	}
+	for i, call := range calls {
+		itemID := response.Output[i].ID
+		writeResponsesSSEEvent(c, "response.output_item.added", officialtypes.ResponsesFunctionCallAddedEvent(i, itemID, call))
+		writeResponsesSSEEvent(c, "response.function_call_arguments.delta", officialtypes.ResponsesFunctionCallArgumentsDeltaEvent(i, itemID, call.Function.Arguments))
+		writeResponsesSSEEvent(c, "response.function_call_arguments.done", officialtypes.ResponsesFunctionCallArgumentsDoneEvent(i, itemID, call))
+		writeResponsesSSEEvent(c, "response.output_item.done", officialtypes.ResponsesFunctionCallDoneEvent(i, itemID, call))
+	}
+	writeResponsesSSEEvent(c, "response.completed", officialtypes.ResponsesCompletedEvent{
+		Type:     "response.completed",
+		Response: response,
+	})
+	c.Writer.Flush()
+}
+
+func writeResponsesSSEEvent(c *gin.Context, event string, payload interface{}) {
+	data, _ := json.Marshal(payload)
+	c.Writer.WriteString("event: " + event + "\ndata: " + string(data) + "\n\n")
+}
+
+type toolCallingResult struct {
+	Text           string
+	ToolCalls      []officialtypes.ToolCall
+	ConversationID string
+	Sentinel       []map[string]interface{}
+}
+
 // handleToolCalling 工具调用模式的主流程（对齐 initialize/handlers.go:handleToolCalling）
 func (h *ChatHandler) handleToolCalling(c *gin.Context, originalRequest *officialtypes.APIRequest, client **bogdanfinn.TlsClient, account *accounts.Account, clientState **chatgpt.ChatClientState, reqModel *string, uid *string, proxyUrl *string, inputTokens *int) {
+	result, ok := h.executeToolCalling(c, originalRequest, client, account, clientState, reqModel, uid, proxyUrl)
+	if !ok {
+		return
+	}
+	if len(result.ToolCalls) > 0 {
+		c.JSON(200, officialtypes.NewChatCompletionWithToolCalls(
+			result.Text, "", result.ToolCalls,
+			*inputTokens, util.CountToken(result.Text),
+			*reqModel, result.ConversationID, result.Sentinel,
+		))
+		return
+	}
+	outputTokens := util.CountToken(result.Text)
+	c.JSON(200, officialtypes.NewChatCompletionWithMetadata(result.Text, *inputTokens, outputTokens, *reqModel, result.ConversationID, result.Sentinel))
+}
+
+func applyClientStateToToolRequest(request *chatgpt_types.ChatGPTRequest, state *chatgpt.ChatClientState) {
+	if request == nil || state == nil || request.ConversationID != "" || state.ConversationID == "" {
+		return
+	}
+	request.ConversationID = state.ConversationID
+	request.ParentMessageID = state.ParentMessageID
+}
+
+func (h *ChatHandler) executeToolCalling(c *gin.Context, originalRequest *officialtypes.APIRequest, client **bogdanfinn.TlsClient, account *accounts.Account, clientState **chatgpt.ChatClientState, reqModel *string, uid *string, proxyUrl *string) (toolCallingResult, bool) {
 	if account == nil || !account.Type.Satisfies(accounts.CapToolCalling) {
 		c.JSON(403, gin.H{"error": "Tool calling requires a logged-in ChatGPT account."})
-		return
+		return toolCallingResult{}, false
 	}
 	tools := originalRequest.Tools
 	maxRefusalRetries := h.cfg.RefusalRetries
@@ -671,6 +794,7 @@ func (h *ChatHandler) handleToolCalling(c *gin.Context, originalRequest *officia
 	}
 
 	baseTranslated := chatgptrequestconverter.ConvertAPIRequest(*originalRequest, account, *proxyUrl, *client)
+	applyClientStateToToolRequest(&baseTranslated, *clientState)
 	if baseTranslated.ConversationID != "" {
 		*clientState = h.sessions.Get(baseTranslated.ConversationID)
 	}
@@ -700,7 +824,7 @@ func (h *ChatHandler) handleToolCalling(c *gin.Context, originalRequest *officia
 				"param":   "model",
 				"code":    "request_conversion_error",
 			}})
-			return
+			return toolCallingResult{}, false
 		}
 		result := chatgpt.HandlerDetailedWithOptions(c, response, *client, account, *uid, translated, false, *reqModel, chatgpt.HandlerDetailedOptions{
 			Websocket:        wsConn,
@@ -746,16 +870,12 @@ func (h *ChatHandler) handleToolCalling(c *gin.Context, originalRequest *officia
 		}
 	}
 
-	if len(lastToolCalls) > 0 {
-		c.JSON(200, officialtypes.NewChatCompletionWithToolCalls(
-			lastText, "", lastToolCalls,
-			*inputTokens, util.CountToken(lastText),
-			*reqModel, lastConversationID, lastSentinel,
-		))
-		return
-	}
-	outputTokens := util.CountToken(lastText)
-	c.JSON(200, officialtypes.NewChatCompletionWithMetadata(lastText, *inputTokens, outputTokens, *reqModel, lastConversationID, lastSentinel))
+	return toolCallingResult{
+		Text:           lastText,
+		ToolCalls:      lastToolCalls,
+		ConversationID: lastConversationID,
+		Sentinel:       lastSentinel,
+	}, true
 }
 
 func (h *ChatHandler) ChatGPTConversation(c *gin.Context) {

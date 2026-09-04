@@ -2,7 +2,11 @@ package official
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type ChatCompletionChunk struct {
@@ -44,9 +48,9 @@ type Delta struct {
 // ToolCallDelta 是 OpenAI 协议里 delta.tool_calls 元素的最小形态:
 // 流式响应中 name / arguments 按"先 name 后 arguments"分块发出。
 type ToolCallDelta struct {
-	Index    int             `json:"index"`
-	ID       string          `json:"id,omitempty"`
-	Type     string          `json:"type,omitempty"`
+	Index    int               `json:"index"`
+	ID       string            `json:"id,omitempty"`
+	Type     string            `json:"type,omitempty"`
 	Function ToolCallFuncDelta `json:"function"`
 }
 
@@ -259,8 +263,8 @@ type ResponsesResponse struct {
 	Usage            ResponsesUsage        `json:"usage"`
 	ReasoningContent string                `json:"reasoning_content,omitempty"`
 	// MsSinceStart / MsTTFT 是流式响应的耗时信息（毫秒），嵌入 response.completed 事件。
-	MsSinceStart     int64                 `json:"ms_since_start,omitempty"`
-	MsTTFT           int64                 `json:"ms_ttft,omitempty"`
+	MsSinceStart int64 `json:"ms_since_start,omitempty"`
+	MsTTFT       int64 `json:"ms_ttft,omitempty"`
 }
 
 type ResponsesTextDeltaEvent struct {
@@ -287,11 +291,15 @@ type ResponsesCompletedEvent struct {
 }
 
 func NewResponsesResponse(text, reasoning string, inputTokens, outputTokens, reasoningTokens int, cachedTokens, cacheWriteTokens int, model string) ResponsesResponse {
+	return NewResponsesResponseWithToolCalls(text, reasoning, nil, inputTokens, outputTokens, reasoningTokens, cachedTokens, cacheWriteTokens, model)
+}
+
+func NewResponsesResponseWithToolCalls(text, reasoning string, toolCalls []ToolCall, inputTokens, outputTokens, reasoningTokens int, cachedTokens, cacheWriteTokens int, model string) ResponsesResponse {
 	if model == "" {
 		model = "auto"
 	}
 	resp := ResponsesResponse{
-		ID:               "resp_QXlha2FBbmROaXhpZUFyZUF3ZXNvbWUK",
+		ID:               "resp_" + uuid.NewString(),
 		Object:           "response",
 		CreatedAt:        time.Now().Unix(),
 		Status:           "completed",
@@ -310,15 +318,23 @@ func NewResponsesResponse(text, reasoning string, inputTokens, outputTokens, rea
 			},
 			TotalTokens: inputTokens + outputTokens,
 		},
-		Output: []ResponsesOutputItem{
-			{
-				ID:     "msg_QXlha2FBbmROaXhpZUFyZUF3ZXNvbWUK",
-				Type:   "message",
-				Status: "completed",
-				Role:   "assistant",
-				Content: []ResponsesContentPart{
-					{Type: "output_text", Text: text},
-				},
+	}
+	if len(toolCalls) > 0 {
+		resp.OutputText = ""
+		resp.Output = make([]ResponsesOutputItem, 0, len(toolCalls))
+		for i, call := range toolCalls {
+			resp.Output = append(resp.Output, responsesFunctionCallItem(i, call, true))
+		}
+		return resp
+	}
+	resp.Output = []ResponsesOutputItem{
+		{
+			ID:     "msg_QXlha2FBbmROaXhpZUFyZUF3ZXNvbWUK",
+			Type:   "message",
+			Status: "completed",
+			Role:   "assistant",
+			Content: []ResponsesContentPart{
+				{Type: "output_text", Text: text},
 			},
 		},
 	}
@@ -335,6 +351,23 @@ func NewResponsesResponse(text, reasoning string, inputTokens, outputTokens, rea
 		}, resp.Output...)
 	}
 	return resp
+}
+
+func responsesFunctionCallItem(index int, call ToolCall, completed bool) ResponsesOutputItem {
+	status := "in_progress"
+	arguments := ""
+	if completed {
+		status = "completed"
+		arguments = call.Function.Arguments
+	}
+	return ResponsesOutputItem{
+		ID:        fmt.Sprintf("fc_%d_%s", index, strings.TrimPrefix(call.ID, "call_")),
+		Type:      "function_call",
+		Status:    status,
+		CallID:    call.ID,
+		Name:      call.Function.Name,
+		Arguments: arguments,
+	}
 }
 
 func ResponsesTextDelta(text string) string {
@@ -371,11 +404,11 @@ func ResponsesCompleted(response ResponsesResponse) string {
 
 // ResponsesUsage 对齐 OpenAI ResponseUsage。
 type ResponsesUsage struct {
-	InputTokens         int                        `json:"input_tokens"`
+	InputTokens         int                          `json:"input_tokens"`
 	InputTokensDetails  ResponsesInputTokensDetails  `json:"input_tokens_details"`
-	OutputTokens        int                        `json:"output_tokens"`
+	OutputTokens        int                          `json:"output_tokens"`
 	OutputTokensDetails ResponsesOutputTokensDetails `json:"output_tokens_details"`
-	TotalTokens         int                        `json:"total_tokens"`
+	TotalTokens         int                          `json:"total_tokens"`
 }
 
 type ResponsesInputTokensDetails struct {
@@ -389,11 +422,14 @@ type ResponsesOutputTokensDetails struct {
 
 // ResponsesOutputItem 对齐 OpenAI ResponseOutputItem 的最小形态。
 type ResponsesOutputItem struct {
-	ID      string                 `json:"id"`
-	Type    string                 `json:"type"` // "message" | "reasoning"
-	Status  string                 `json:"status,omitempty"`
-	Role    string                 `json:"role,omitempty"`
-	Content []ResponsesContentPart `json:"content"`
+	ID        string                 `json:"id,omitempty"`
+	Type      string                 `json:"type"` // "message" | "reasoning" | "function_call"
+	Status    string                 `json:"status,omitempty"`
+	Role      string                 `json:"role,omitempty"`
+	Content   []ResponsesContentPart `json:"content,omitempty"`
+	CallID    string                 `json:"call_id,omitempty"`
+	Name      string                 `json:"name,omitempty"`
+	Arguments string                 `json:"arguments,omitempty"`
 }
 
 type ResponsesContentPart struct {
@@ -407,6 +443,74 @@ type ResponsesReasoningItem struct {
 	Type    string                 `json:"type"` // "reasoning"
 	Status  string                 `json:"status"`
 	Content []ResponsesContentPart `json:"content"`
+}
+
+type ResponsesFunctionCallAdded struct {
+	Type        string              `json:"type"`
+	OutputIndex int                 `json:"output_index"`
+	Item        ResponsesOutputItem `json:"item"`
+}
+
+type ResponsesFunctionCallArgumentsDelta struct {
+	Type        string `json:"type"`
+	ItemID      string `json:"item_id"`
+	OutputIndex int    `json:"output_index"`
+	Delta       string `json:"delta"`
+}
+
+type ResponsesFunctionCallArgumentsDone struct {
+	Type        string `json:"type"`
+	ItemID      string `json:"item_id"`
+	OutputIndex int    `json:"output_index"`
+	CallID      string `json:"call_id"`
+	Name        string `json:"name"`
+	Arguments   string `json:"arguments"`
+}
+
+type ResponsesFunctionCallDone struct {
+	Type        string              `json:"type"`
+	OutputIndex int                 `json:"output_index"`
+	Item        ResponsesOutputItem `json:"item"`
+}
+
+func ResponsesFunctionCallAddedEvent(outputIndex int, itemID string, call ToolCall) ResponsesFunctionCallAdded {
+	item := responsesFunctionCallItem(outputIndex, call, false)
+	item.ID = itemID
+	return ResponsesFunctionCallAdded{
+		Type:        "response.output_item.added",
+		OutputIndex: outputIndex,
+		Item:        item,
+	}
+}
+
+func ResponsesFunctionCallArgumentsDeltaEvent(outputIndex int, itemID, delta string) ResponsesFunctionCallArgumentsDelta {
+	return ResponsesFunctionCallArgumentsDelta{
+		Type:        "response.function_call_arguments.delta",
+		ItemID:      itemID,
+		OutputIndex: outputIndex,
+		Delta:       delta,
+	}
+}
+
+func ResponsesFunctionCallArgumentsDoneEvent(outputIndex int, itemID string, call ToolCall) ResponsesFunctionCallArgumentsDone {
+	return ResponsesFunctionCallArgumentsDone{
+		Type:        "response.function_call_arguments.done",
+		ItemID:      itemID,
+		OutputIndex: outputIndex,
+		CallID:      call.ID,
+		Name:        call.Function.Name,
+		Arguments:   call.Function.Arguments,
+	}
+}
+
+func ResponsesFunctionCallDoneEvent(outputIndex int, itemID string, call ToolCall) ResponsesFunctionCallDone {
+	item := responsesFunctionCallItem(outputIndex, call, true)
+	item.ID = itemID
+	return ResponsesFunctionCallDone{
+		Type:        "response.output_item.done",
+		OutputIndex: outputIndex,
+		Item:        item,
+	}
 }
 
 // ResponsesReasoningDeltaEvent 流式思维链事件。
